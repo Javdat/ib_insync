@@ -1,24 +1,28 @@
-import logging
+"""Deserialize and dispatch messages."""
 
-from .contract import Contract
-from .order import Order, OrderCondition
+import dataclasses
+import logging
+from datetime import datetime, timezone
+
+from .contract import (
+    ComboLeg, Contract, ContractDescription, ContractDetails,
+    DeltaNeutralContract)
 from .objects import (
-    ContractDetails, ContractDescription, ComboLeg, OrderComboLeg,
-    OrderState, TagValue, Execution, CommissionReport,
-    BarData, DeltaNeutralContract, SoftDollarTier, FamilyCode,
-    SmartComponent, DepthMktDataDescription, NewsProvider,
-    TickAttribBidAsk, TickAttribLast, HistogramData, PriceIncrement,
-    HistoricalTick, HistoricalTickBidAsk, HistoricalTickLast)
-from .util import UNSET_DOUBLE
+    BarData, CommissionReport, DepthMktDataDescription, Execution, FamilyCode,
+    HistogramData, HistoricalTick, HistoricalTickBidAsk, HistoricalTickLast,
+    NewsProvider, PriceIncrement, SmartComponent, SoftDollarTier, TagValue,
+    TickAttribBidAsk, TickAttribLast)
+from .order import Order, OrderComboLeg, OrderCondition, OrderState
+from .util import UNSET_DOUBLE, parseIBDatetime
+from .wrapper import Wrapper
 
 __all__ = ['Decoder']
 
 
 class Decoder:
-    """
-    Decode IB messages and invoke corresponding wrapper methods.
-    """
-    def __init__(self, wrapper, serverVersion):
+    """Decode IB messages and invoke corresponding wrapper methods."""
+
+    def __init__(self, wrapper: Wrapper, serverVersion: int):
         self.wrapper = wrapper
         self.serverVersion = serverVersion
         self.logger = logging.getLogger('ib_insync.Decoder')
@@ -179,9 +183,7 @@ class Decoder:
         return handler if method else lambda *args: None
 
     def interpret(self, fields):
-        """
-        Decode fields and invoke corresponding wrapper method.
-        """
+        """Decode fields and invoke corresponding wrapper method."""
         try:
             msgId = int(fields[0])
             handler = self.handlers[msgId]
@@ -190,20 +192,18 @@ class Decoder:
             self.logger.exception(f'Error handling fields: {fields}')
 
     def parse(self, obj):
-        """
-        Parse the object's properties according to its default types.
-        """
-        for k, default in obj.__class__.defaults.items():
-            typ = type(default)
+        """Parse the object's properties according to its default types."""
+        for field in dataclasses.fields(obj):
+            typ = type(field.default)
             if typ is str:
                 continue
-            v = getattr(obj, k)
+            v = getattr(obj, field.name)
             if typ is int:
-                setattr(obj, k, int(v) if v else default)
+                setattr(obj, field.name, int(v) if v else field.default)
             elif typ is float:
-                setattr(obj, k, float(v) if v else default)
+                setattr(obj, field.name, float(v) if v else field.default)
             elif typ is bool:
-                setattr(obj, k, bool(int(v)) if v else default)
+                setattr(obj, field.name, bool(int(v)) if v else field.default)
 
     def priceSizeTick(self, fields):
         _, _, reqId, tickType, price, size, _ = fields
@@ -383,7 +383,7 @@ class Decoder:
             c.localSymbol,
             c.tradingClass,
             ex.execId,
-            ex.time,
+            timeStr,
             ex.acctNumber,
             ex.exchange,
             ex.side,
@@ -402,6 +402,11 @@ class Decoder:
 
         self.parse(c)
         self.parse(ex)
+        time = parseIBDatetime(timeStr)
+        tz = self.wrapper.ib.TimezoneTWS
+        if tz:
+            time = tz.localize(time)
+        ex.time = time.astimezone(timezone.utc)
         self.wrapper.execDetails(int(reqId), c, ex)
 
     def historicalData(self, fields):
@@ -680,8 +685,9 @@ class Decoder:
             get()
             price = float(get())
             size = int(get())
+            dt = datetime.fromtimestamp(time, timezone.utc)
             ticks.append(
-                HistoricalTick(time, price, size))
+                HistoricalTick(dt, price, size))
 
         done = bool(int(get()))
         self.wrapper.historicalTicks(int(reqId), ticks, done)
@@ -701,9 +707,10 @@ class Decoder:
             priceAsk = float(get())
             sizeBid = int(get())
             sizeAsk = int(get())
+            dt = datetime.fromtimestamp(time, timezone.utc)
             ticks.append(
                 HistoricalTickBidAsk(
-                    time, attrib, priceBid, priceAsk, sizeBid, sizeAsk))
+                    dt, attrib, priceBid, priceAsk, sizeBid, sizeAsk))
 
         done = bool(int(get()))
         self.wrapper.historicalTicksBidAsk(int(reqId), ticks, done)
@@ -723,9 +730,10 @@ class Decoder:
             size = int(get())
             exchange = get()
             specialConditions = get()
+            dt = datetime.fromtimestamp(time, timezone.utc)
             ticks.append(
                 HistoricalTickLast(
-                    time, attrib, price, size, exchange, specialConditions))
+                    dt, attrib, price, size, exchange, specialConditions))
 
         done = bool(int(get()))
         self.wrapper.historicalTicksLast(int(reqId), ticks, done)
@@ -979,7 +987,7 @@ class Decoder:
             for _ in range(numConditions):
                 condType = int(fields.pop(0))
                 condCls = OrderCondition.createClass(condType)
-                n = len(condCls.defaults) - 1
+                n = len(dataclasses.fields(condCls)) - 1
                 cond = condCls(condType, *fields[:n])
                 self.parse(cond)
                 o.conditions.append(cond)
@@ -1192,7 +1200,7 @@ class Decoder:
             for _ in range(numConditions):
                 condType = int(fields.pop(0))
                 condCls = OrderCondition.createClass(condType)
-                n = len(condCls.defaults) - 1
+                n = len(dataclasses.fields(condCls)) - 1
                 cond = condCls(condType, *fields[:n])
                 self.parse(cond)
                 o.conditions.append(cond)

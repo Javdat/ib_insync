@@ -4,9 +4,85 @@ Changelog
 0.9
 ---
 
-* PR #184, #185 and #186 have added support for Ticker fields
+Version 0.9.64
+^^^^^^^^^^^^^^
+
+* Fixed: :issue:`309`: Aggregate past fills into the ``Trade`` they belong to upon connect.
+* ``ContFut`` objects are now hashable (:issue:`310`).
+* Added ``Watchdog.probeTimeout`` parameter (:issue:`307`).
+
+Version 0.9.63
+^^^^^^^^^^^^^^
+
+* Fixed :issue:`282`: ``util.Qt()`` also works with the ProactorEventLoop
+  (default on Windows) now.
+* Fixed :issue:`303`: A regression in TWS 480.4l+ is bypassed now to avoid
+  ``IB.connect()`` timeouts. Request timeouts during syncing are logged as errors but will let
+  the connect proceed.
+
+Version 0.9.62
+^^^^^^^^^^^^^^
+
+* ``IB.TimezoneTWS`` field added, for when the TWS timezone differs from the
+  local system timezone (:issue:`287`).
+* ``IB.RaiseRequestErrors`` field added, can be set to ``True`` to raise
+  ``RequestError`` when certain requests fail, instead of returning
+  empty data (:pull:`296`).
+* ``IB.accountSummaryAsync()`` method added (:issue:`267`).
+* ``Watchdog.probeContract`` field added, to use a contract other then EURUSD
+  for probing the data connection (:issue:`298`).
+* ``Ticker.rtTime`` added (:issue:`274`, :pull:`275`). Please note that this
+  timestamp appears to be mostly bogus.
+* Fixed :issue:`270`: Clear ticker depth data when canceling market
+  depth subscription.
+* Fixed issue with duplicate order IDs.
+
+Version 0.9.61
+^^^^^^^^^^^^^^
+* ``Ticker.marketDataType`` added to indicate the delayed/frozen status of
+  the ``reqMktData`` ticks.
+
+Version 0.9.60
+^^^^^^^^^^^^^^
+
+* ``IB.reqHistoricalData()`` has a new ``timeout`` parameter that automatically
+  cancels the request after timing out.
+* ``BracketOrder`` is iterable again.
+* ``IB.waitOnUpdate()`` returns ``False`` on timeout now.
+* :pull:`210`: Fix decoding of execDetails time.
+* :pull:`215`: New scanner notebook added, courtesy of C. Valcarcel.
+* :pull:`220`: Added ``readonly`` option for Watchdog.
+* Fixed :issue:`221`: Delayed close ticks handling by ``Ticker``.
+* Fixed :issue:`224`: Added timeout for ``completedOrders`` request during connect.
+* Fixed :issue:`227`: ``IB.MaxSyncedSubAccounts`` added.
+* Fixed :issue:`230`: Fixed ``IB.reqHistogramData`` method.
+* Fixed :issue:`235`: ``Order.discretionaryAmt`` is now of type ``float`` (was ``int``).
+* Fixed :issue:`236`: ``ticker.updateEvent`` is now fired for any change made to the ticker.
+* Fixed :issue:`245`: Emit ``trade.statusEvent`` when order is implicitly canceled by a problem.
+* You can now `sponsor the development of IB-insync! <https://github.com/sponsors/erdewit>`_
+
+Version 0.9.59
+^^^^^^^^^^^^^^
+
+* PR #205 adds more typing annotations.
+* ``dataclasses`` are now used for objects (instead of inheriting from a base
+  ``Object``). For Python 3.6.* install it with ``pip install dataclasses``
+
+Version 0.9.58
+^^^^^^^^^^^^^^
+
+* PR #196 treats error 492 as a warning so that scanner results can still
+  be used.
+
+Version 0.9.57
+^^^^^^^^^^^^^^
+
+* PR #184, #185 and #186 add the new Ticker fields
   ``rtTradeVolume``, ``auctionVolume``, ``auctionPrice`` and
   ``auctionImbalance``.
+* PR #191 lets ``util.schedule`` return a handle that can be canceled.
+* PR #192 adds ``throttleStart`` and ``throttleEnd`` events to the ``Client``.
+* PR #194 adds better JSON support for ``namedtuple`` objects.
 
 Version 0.9.56
 ^^^^^^^^^^^^^^

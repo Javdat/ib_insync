@@ -1,18 +1,20 @@
-import struct
+"""Socket client for communicating with Interactive Brokers."""
+
 import asyncio
-import logging
-import time
 import io
+import logging
+import struct
+import time
 from collections import deque
-from typing import List
+from typing import List, Optional
 
 from eventkit import Event
 
-from .contract import Contract
 from .connection import Connection
+from .contract import Contract
 from .decoder import Decoder
 from .objects import ConnectionStats
-from .util import run, UNSET_INTEGER, UNSET_DOUBLE
+from .util import UNSET_DOUBLE, UNSET_INTEGER, dataclassAsTuple, run
 
 __all__ = ['Client']
 
@@ -74,9 +76,11 @@ class Client:
       * ``apiStart`` ()
       * ``apiEnd`` ()
       * ``apiError`` (errorMsg: str)
+      * ``throttleStart`` ()
+      * ``throttleEnd`` ()
     """
 
-    events = ('apiStart', 'apiEnd', 'apiError')
+    events = ('apiStart', 'apiEnd', 'apiError', 'throttleStart', 'throttleEnd')
 
     MaxRequests = 45
     RequestsInterval = 1
@@ -88,33 +92,37 @@ class Client:
 
     def __init__(self, wrapper):
         self.wrapper = wrapper
-        self.decoder = Decoder(wrapper, None)
+        self.decoder = Decoder(wrapper, 0)
         self.apiStart = Event('apiStart')
         self.apiEnd = Event('apiEnd')
         self.apiError = Event('apiError')
-        self._readyEvent = asyncio.Event()
-        self._loop = asyncio.get_event_loop()
+        self.throttleStart = Event('throttleStart')
+        self.throttleEnd = Event('throttleEnd')
         self._logger = logging.getLogger('ib_insync.client')
-        self.reset()
+
+        self.conn = Connection()
+        self.conn.hasData += self._onSocketHasData
+        self.conn.disconnected += self._onSocketDisconnected
 
         # extra optional wrapper methods
         self._priceSizeTick = getattr(wrapper, 'priceSizeTick', None)
         self._tcpDataArrived = getattr(wrapper, 'tcpDataArrived', None)
         self._tcpDataProcessed = getattr(wrapper, 'tcpDataProcessed', None)
 
-    def reset(self):
-        self.host = None
-        self.port = None
-        self.clientId = None
-        self.conn = None
-        self.connState = Client.DISCONNECTED
+        self.host = ''
+        self.port = -1
+        self.clientId = -1
         self.optCapab = ''
+        self.connectOptions = b''
+        self.reset()
+
+    def reset(self):
+        self.connState = Client.DISCONNECTED
+        self._apiReady = False
         self._serverVersion = None
-        self._readyEvent.clear()
         self._data = b''
-        self._connectOptions = b''
         self._reqIdSeq = 0
-        self._accounts = None
+        self._accounts = []
         self._startTime = time.time()
         self._numBytesRecv = 0
         self._numMsgRecv = 0
@@ -126,21 +134,18 @@ class Client:
         return self._serverVersion
 
     def run(self):
-        self._loop.run_forever()
+        loop = asyncio.get_event_loop()
+        loop.run_forever()
 
     def isConnected(self):
         return self.connState == Client.CONNECTED
 
     def isReady(self) -> bool:
-        """
-        Is the API connection up and running?
-        """
-        return self._readyEvent.is_set()
+        """Is the API connection up and running?"""
+        return self._apiReady
 
     def connectionStats(self) -> ConnectionStats:
-        """
-        Get statistics about the connection.
-        """
+        """Get statistics about the connection."""
         if not self.isReady():
             raise ConnectionError('Not connected')
         return ConnectionStats(
@@ -150,19 +155,19 @@ class Client:
             self._numMsgRecv, self.conn.numMsgSent)
 
     def getReqId(self) -> int:
-        """
-        Get new request ID.
-        """
+        """Get new request ID."""
         if not self.isReady():
             raise ConnectionError('Not connected')
         newId = self._reqIdSeq
         self._reqIdSeq += 1
         return newId
 
+    def updateReqId(self, minReqId):
+        """Update the next reqId to be at least ``minReqId``."""
+        self._reqIdSeq = max(self._reqIdSeq, minReqId)
+
     def getAccounts(self) -> List[str]:
-        """
-        Get the list of account names that are under management.
-        """
+        """Get the list of account names that are under management."""
         if not self.isReady():
             raise ConnectionError('Not connected')
         return self._accounts
@@ -175,10 +180,11 @@ class Client:
             connectOptions: Use "+PACEAPI" to use request-pacing built
                 into TWS/gateway 974+.
         """
-        self._connectOptions = connectOptions.encode()
+        self.connectOptions = connectOptions.encode()
 
     def connect(
-            self, host: str, port: int, clientId: int, timeout: float = 2):
+            self, host: str, port: int, clientId: int,
+            timeout: Optional[float] = 2.0):
         """
         Connect to a running TWS or IB gateway application.
 
@@ -193,32 +199,23 @@ class Client:
         """
         run(self.connectAsync(host, port, clientId, timeout))
 
-    async def connectAsync(self, host, port, clientId, timeout=2):
-
-        async def connect():
+    async def connectAsync(self, host, port, clientId, timeout=2.0):
+        try:
             self._logger.info(
                 f'Connecting to {host}:{port} with clientId {clientId}...')
             self.host = host
             self.port = port
             self.clientId = clientId
             self.connState = Client.CONNECTING
-            self.conn = Connection(host, port)
-            self.conn.hasData = self._onSocketHasData
-            self.conn.disconnected = self._onSocketDisconnected
-            self.conn.hasError = self._onSocketHasError
-            await asyncio.sleep(0)  # in case of a not yet finished disconnect
-            await self.conn.connectAsync()
+            timeout = timeout or None
+            await asyncio.wait_for(self.conn.connectAsync(host, port), timeout)
             self._logger.info('Connected')
             msg = b'API\0' + self._prefix(b'v%d..%d%s' % (
                 self.MinClientVersion, self.MaxClientVersion,
-                b' ' + self._connectOptions if self._connectOptions else b''))
+                b' ' + self.connectOptions if self.connectOptions else b''))
             self.conn.sendMsg(msg)
-            await self._readyEvent.wait()
+            await asyncio.wait_for(self.apiStart, timeout)
             self._logger.info('API connection ready')
-            self.apiStart.emit()
-
-        try:
-            await asyncio.wait_for(connect(), timeout or None)
         except Exception as e:
             self.disconnect()
             msg = f'API connection failed: {e!r}'
@@ -229,19 +226,14 @@ class Client:
             raise
 
     def disconnect(self):
-        """
-        Disconnect from IB connection.
-        """
+        """Disconnect from IB connection."""
+        self._logger.info('Disconnecting')
         self.connState = Client.DISCONNECTED
-        if self.conn is not None:
-            self._logger.info('Disconnecting')
-            self.conn.disconnect()
-            self.reset()
+        self.conn.disconnect()
+        self.reset()
 
     def send(self, *fields):
-        """
-        Serialize and send the given fields using the IB socket protocol.
-        """
+        """Serialize and send the given fields using the IB socket protocol."""
         if not self.isConnected():
             raise ConnectionError('Not connected')
 
@@ -272,7 +264,8 @@ class Client:
         self.sendMsg(msg.getvalue())
 
     def sendMsg(self, msg):
-        t = self._loop.time()
+        loop = asyncio.get_event_loop()
+        t = loop.time()
         times = self._timeQ
         msgs = self._msgQ
         while times and t - times[0] > self.RequestsInterval:
@@ -288,14 +281,16 @@ class Client:
         if msgs:
             if not self._isThrottling:
                 self._isThrottling = True
-                self._logger.warning('Started to throttle requests')
-            self._loop.call_at(
+                self.throttleStart.emit()
+                self._logger.debug('Started to throttle requests')
+            loop.call_at(
                 times[0] + self.RequestsInterval,
                 self.sendMsg, None)
         else:
             if self._isThrottling:
                 self._isThrottling = False
-                self._logger.warning('Stopped to throttle requests')
+                self.throttleEnd.emit()
+                self._logger.debug('Stopped to throttle requests')
 
     def _prefix(self, msg):
         # prefix a message with its length
@@ -331,7 +326,7 @@ class Client:
                 version, _connTime = fields
                 self._serverVersion = int(version)
                 if self._serverVersion < self.MinClientVersion:
-                    self._onSocketHasError(
+                    self._onSocketDisconnected(
                         'TWS/gateway version must be >= 972')
                     return
                 self.decoder.serverVersion = self._serverVersion
@@ -341,20 +336,19 @@ class Client:
                 self._logger.info(
                     f'Logged on to server version {self._serverVersion}')
             else:
-                if not self._readyEvent.is_set():
+                if not self._apiReady:
                     # snoop for nextValidId and managedAccounts response,
                     # when both are in then the client is ready
                     msgId = int(fields[0])
                     if msgId == 9:
                         _, _, validId = fields
                         self._reqIdSeq = int(validId)
-                        if self._accounts:
-                            self._readyEvent.set()
                     elif msgId == 15:
                         _, _, accts = fields
                         self._accounts = [a for a in accts.split(',') if a]
-                        if self._reqIdSeq:
-                            self._readyEvent.set()
+                    if self._reqIdSeq and self._accounts:
+                        self._apiReady = True
+                        self.apiStart.emit()
 
                 # decode and handle the message
                 self.decoder.interpret(fields)
@@ -362,27 +356,22 @@ class Client:
         if self._tcpDataProcessed:
             self._tcpDataProcessed()
 
-    def _onSocketDisconnected(self):
-        if self.isConnected():
-            msg = f'Peer closed connection'
+    def _onSocketDisconnected(self, msg):
+        wasReady = self.isReady()
+        if not self.isConnected():
+            self._logger.info('Disconnected.')
+        elif not msg:
+            msg = 'Peer closed connection.'
+            if not wasReady:
+                msg += f' clientId {self.clientId} already in use?'
+        if msg:
             self._logger.error(msg)
-            if not self.isReady():
-                msg = f'clientId {self.clientId} already in use?'
-                self._logger.error(msg)
             self.apiError.emit(msg)
-        else:
-            self._logger.info('Disconnected')
-        if self.isReady():
+        if wasReady:
             self.wrapper.connectionClosed()
         self.reset()
-        self.apiEnd.emit()
-
-    def _onSocketHasError(self, msg):
-        self._logger.error(msg)
-        if self.isReady():
-            self.wrapper.connectionClosed()
-        self.reset()
-        self.apiError.emit(msg)
+        if wasReady:
+            self.apiEnd.emit()
 
     # client request methods
     # the message type id is sent first, often followed by a version number
@@ -576,7 +565,7 @@ class Client:
         fields += [len(order.conditions)]
         if order.conditions:
             for cond in order.conditions:
-                fields += cond.dict().values()
+                fields += dataclassAsTuple(cond)
             fields += [
                 order.conditionsIgnoreRth,
                 order.conditionsCancelOrder]
@@ -917,7 +906,9 @@ class Client:
             useRTH, whatToShow, formatDate)
 
     def reqHistogramData(self, tickerId, contract, useRTH, timePeriod):
-        self.send(88, tickerId, contract, useRTH, timePeriod)
+        self.send(
+            88, tickerId, contract, contract.includeExpired,
+            useRTH, timePeriod)
 
     def cancelHistogramData(self, tickerId):
         self.send(89, tickerId)
